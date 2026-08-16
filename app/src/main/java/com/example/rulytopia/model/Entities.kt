@@ -58,20 +58,22 @@ data class BlockEntity(
     var angularVelocity: Float = 0f,
     val material: MaterialType,
     val shape: BlockShape = BlockShape.RECTANGLE,
-    var currentHp: Float,
-    val maxHp: Float,
-    val mass: Float,
+    var currentHp: Float = ((width * height) * material.maxHpPerArea).coerceAtLeast(10f),
+    val maxHp: Float = ((width * height) * material.maxHpPerArea).coerceAtLeast(10f),
+    val mass: Float = (((width * height) / 100f) * material.density).coerceAtLeast(0.5f),
     var isBroken: Boolean = false,
     var isResting: Boolean = false,
     var crackIntensity: Float = 0f, // 0.0 = clean, 1.0 = heavy cracks
     var damageCooldown: Float = 0f
 ) {
-    fun takeDamage(amount: Float) {
+    fun takeDamage(amount: Float): Float {
+        val actualDmg = amount.coerceAtMost(currentHp)
         currentHp -= amount
         crackIntensity = (1f - (currentHp / maxHp)).coerceIn(0f, 1f)
         if (currentHp <= 0f) {
             isBroken = true
         }
+        return actualDmg
     }
 }
 
@@ -88,6 +90,7 @@ data class MonkeyEntity(
     var currentHp: Float = type.maxHp,
     val maxHp: Float = type.maxHp,
     val radius: Float = type.radius,
+    val mass: Float = 1.5f,
     var isDefeated: Boolean = false,
     var isResting: Boolean = false,
     var state: MonkeyState = MonkeyState.IDLE,
@@ -105,6 +108,7 @@ data class MonkeyEntity(
         } else if (type == MonkeyType.SHIELDED && isDirectFrontalHit) {
             effectiveDamage *= (1f - type.armorDamageReduction)
         }
+        val actualDmg = effectiveDamage.coerceAtMost(currentHp)
         currentHp -= effectiveDamage
         hitTimer = 0.5f
         state = MonkeyState.HIT
@@ -112,7 +116,7 @@ data class MonkeyEntity(
             isDefeated = true
             state = MonkeyState.DEFEATED
         }
-        return effectiveDamage
+        return actualDmg
     }
 }
 

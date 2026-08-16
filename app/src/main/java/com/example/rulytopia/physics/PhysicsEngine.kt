@@ -2,14 +2,38 @@ package com.example.rulytopia.physics
 
 import androidx.compose.ui.graphics.Color
 import com.example.rulytopia.audio.SoundManager
-import com.example.rulytopia.model.*
-import kotlin.math.*
+import com.example.rulytopia.model.BlockDef
+import com.example.rulytopia.model.BlockEntity
+import com.example.rulytopia.model.BlockShape
+import com.example.rulytopia.model.FruitEntity
+import com.example.rulytopia.model.FruitType
+import com.example.rulytopia.model.LevelDef
+import com.example.rulytopia.model.MaterialType
+import com.example.rulytopia.model.MonkeyDef
+import com.example.rulytopia.model.MonkeyEntity
+import com.example.rulytopia.model.MonkeyState
+import com.example.rulytopia.model.MonkeyType
+import com.example.rulytopia.model.ParticleEntity
+import com.example.rulytopia.model.ParticleShape
+import com.example.rulytopia.model.Vector2D
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.random.Random
 
 /**
- * 2D Physics & Collision Engine for Rulytopia.
- * Features realistic impulse physics, rotational inertia, structural instability & cascading collapses,
- * dynamic monkey rolling & slope physics, fall/crush damage, and punchy fruit abilities.
+ * High-performance 2D Physics Engine for Rulytopia.
+ * Features:
+ * - Granular, support-based structural physics (only genuinely unsupported or impacted blocks fall).
+ * - Stable resting equilibrium (structures remain perfectly rock solid until physically struck).
+ * - Multi-substep fixed-delta numerical integration.
+ * - Material-aware friction, restitution, and durability damage.
+ * - Dynamic slope rolling and crush damage for monkeys.
+ * - Fruit abilities (Banana Turbo Boost, Orange Citrus Blast, Cherry Triple Split, Durian Seismic Quake).
  */
 class PhysicsEngine(
     private val soundManager: SoundManager,
@@ -22,13 +46,22 @@ class PhysicsEngine(
     val monkeys = mutableListOf<MonkeyEntity>()
     val particles = mutableListOf<ParticleEntity>()
 
-    var onScreenShake: ((intensity: Float) -> Unit)? = null
-
-    var gravity = Vector2D(0f, 780f) // px / s^2
+    var gravity = Vector2D(0f, 540f)
     var groundY = 480f
-    var worldWidth = 1100f
+    var worldWidth = 1750f
     var worldHeight = 600f
 
+    enum class ShakeImpact(val trauma: Float) {
+        NONE(0f),
+        MINOR(0.08f),
+        NORMAL(0.18f),
+        STRONG(0.30f),
+        SPECIAL_ORANGE(0.38f),
+        SPECIAL_DURIAN(0.50f)
+    }
+
+    var onScreenShake: ((intensity: Float) -> Unit)? = null
+    var onShakeImpact: ((ShakeImpact) -> Unit)? = null
     var hasFirstShotOccurred: Boolean = false
 
     private val random = Random(System.currentTimeMillis())
@@ -38,48 +71,35 @@ class PhysicsEngine(
         blocks.clear()
         monkeys.clear()
         particles.clear()
+        hasFirstShotOccurred = false
 
         groundY = levelDef.groundY
         worldWidth = levelDef.worldWidth
         worldHeight = levelDef.worldHeight
-        hasFirstShotOccurred = false
 
-        var nextId = 1L
-
-        for (b in levelDef.blocks) {
-            val area = b.width * b.height
-            val hp = area * b.material.maxHpPerArea
-            val mass = area * b.material.density * 0.08f
+        // Build Blocks in stable resting equilibrium
+        levelDef.blocks.forEachIndexed { index, b ->
             blocks.add(
                 BlockEntity(
-                    id = nextId++,
+                    id = index.toLong() + 1,
                     position = Vector2D(b.x, b.y),
                     width = b.width,
                     height = b.height,
-                    angle = b.angle,
-                    velocity = Vector2D.Zero,
-                    angularVelocity = 0f,
                     material = b.material,
                     shape = b.shape,
-                    currentHp = hp,
-                    maxHp = hp,
-                    mass = mass,
+                    angle = b.angle,
                     isResting = true
                 )
             )
         }
 
-        for (m in levelDef.monkeys) {
+        // Build Monkeys in stable resting equilibrium
+        levelDef.monkeys.forEachIndexed { index, m ->
             monkeys.add(
                 MonkeyEntity(
-                    id = nextId++,
-                    type = m.type,
+                    id = index.toLong() + 1,
                     position = Vector2D(m.x, m.y),
-                    velocity = Vector2D.Zero,
-                    angularVelocity = 0f,
-                    currentHp = m.type.maxHp,
-                    maxHp = m.type.maxHp,
-                    radius = m.type.radius,
+                    type = m.type,
                     isResting = true
                 )
             )
@@ -88,15 +108,25 @@ class PhysicsEngine(
 
     fun step(dt: Float) {
         val clampedDt = dt.coerceIn(0.001f, 0.033f)
-
         val substeps = 6
-        val subDt = clampedDt / substeps
+        val subDt = clampedDt / substeps.toFloat()
 
         for (step in 0 until substeps) {
             updateSubstep(subDt)
         }
 
-        updateVisuals(clampedDt)
+        // Update particle lifespans
+        val particleIter = particles.iterator()
+        while (particleIter.hasNext()) {
+            val p = particleIter.next()
+            p.lifeTime -= clampedDt
+            if (p.lifeTime <= 0f) {
+                particleIter.remove()
+            } else {
+                p.velocity += gravity * (clampedDt * 0.4f * p.gravityFactor)
+                p.position += p.velocity * clampedDt
+            }
+        }
     }
 
     private fun updateSubstep(dt: Float) {
@@ -104,26 +134,34 @@ class PhysicsEngine(
         for (fruit in fruits) {
             if (!fruit.isLaunched || fruit.isDead) continue
 
-            val airDrag = if (fruit.type == FruitType.CHERRY) 0.996f else 0.999f
-            fruit.velocity += gravity * dt
-            fruit.velocity *= airDrag
-            fruit.position += fruit.velocity * dt
-            fruit.angle += fruit.angularVelocity * dt
             fruit.flightTime += dt
+
+            // Trailing visual particles
+            if (fruit.velocity.lengthSquared() > 8000f && random.nextFloat() < 0.35f) {
+                particles.add(
+                    ParticleEntity(
+                        position = fruit.position.copy() + Vector2D((random.nextFloat() - 0.5f) * 8f, (random.nextFloat() - 0.5f) * 8f),
+                        velocity = (fruit.velocity * -0.15f) + Vector2D((random.nextFloat() - 0.5f) * 30f, (random.nextFloat() - 0.5f) * 30f),
+                        color = fruit.type.primaryColor.copy(alpha = 0.6f),
+                        size = 5f + random.nextFloat() * 4f,
+                        maxLifeTime = 0.3f,
+                        shape = ParticleShape.CIRCLE
+                    )
+                )
+            }
+
+            // Airborne physics with subtle, time-proportional aerodynamic drag
+            fruit.velocity += gravity * dt
+            fruit.velocity *= (1.0f - 0.012f * dt).coerceIn(0.9f, 1.0f)
+            fruit.position += fruit.velocity * dt
+            fruit.angle += fruit.velocity.x * (dt * 0.04f)
 
             // Ground collision
             if (fruit.position.y + fruit.radius >= groundY) {
                 fruit.position.y = groundY - fruit.radius
                 if (fruit.velocity.y > 0) {
-                    val impactForce = abs(fruit.velocity.y)
-                    fruit.velocity.y = -fruit.velocity.y * fruit.restitution
-                    fruit.velocity.x *= 0.88f
-                    fruit.angularVelocity *= 0.85f
-
-                    if (impactForce > 80f) {
-                        spawnJuiceParticles(fruit.position, fruit.type.primaryColor, 4)
-                        soundManager.playImpact(MaterialType.WOOD, impactForce * 0.4f)
-                    }
+                    fruit.velocity.y = -fruit.velocity.y * (fruit.restitution * 0.45f)
+                    fruit.velocity.x *= 0.88f // ground rolling friction
                 }
             }
 
@@ -137,44 +175,48 @@ class PhysicsEngine(
                 fruit.velocity.x = -fruit.velocity.x * fruit.restitution
             }
 
-            if (fruit.flightTime > 0.8f && fruit.velocity.lengthSquared() < 36f && fruit.position.y + fruit.radius >= groundY - 3f) {
+            // Fruit settles and disappears cleanly after resting or landing
+            val isSlow = fruit.velocity.lengthSquared() < 36f
+            val isOnGround = fruit.position.y + fruit.radius >= groundY - 3f
+
+            if (isOnGround && isSlow && fruit.flightTime > 0.8f) {
                 fruit.isResting = true
+            }
+
+            // Generous airborne lifespan for long-distance arcs across wide arenas
+            if (fruit.flightTime > 4.5f || (fruit.isResting && fruit.flightTime > 1.5f)) {
+                fruit.isDead = true
+                fruit.isResting = true
+                spawnJuiceParticles(fruit.position, fruit.type.primaryColor, 8)
             }
         }
 
-        // 2. Integrate Blocks (Only active moving/unsupported blocks undergo physics)
+        // 2. Integrate Active Dynamic Blocks (Resting blocks stay static in equilibrium)
         for (block in blocks) {
             if (block.isBroken) continue
 
             block.damageCooldown = (block.damageCooldown - dt).coerceAtLeast(0f)
 
-            // If block is in stable resting state, it remains completely static in equilibrium
             if (block.isResting) {
-                block.velocity = Vector2D.Zero
+                block.velocity = Vector2D(0f, 0f)
                 block.angularVelocity = 0f
                 continue
             }
 
-            // Dynamic active block integration
+            // Active physics integration
             block.velocity += gravity * dt
+            block.velocity *= 0.992f
+            block.angularVelocity *= 0.965f
 
-            // Instability tipping torque for dynamic tilted blocks
-            if (abs(block.angle) > 0.05f) {
-                val tiltTorque = sin(block.angle) * (gravity.y * 0.0004f)
-                block.angularVelocity += tiltTorque * dt
-            }
-
-            block.velocity *= 0.992f // subtle air damping
-            block.angularVelocity *= 0.980f
             block.position += block.velocity * dt
             block.angle += block.angularVelocity * dt
 
-            // Ground collision with multi-corner ground contact torque
-            val halfH = block.height / 2f
+            // Ground collision
             val halfW = block.width / 2f
-
+            val halfH = block.height / 2f
             val cosA = cos(block.angle)
             val sinA = sin(block.angle)
+
             val cornerOffsets = arrayOf(
                 Vector2D(-halfW * cosA + halfH * sinA, -halfW * sinA - halfH * cosA),
                 Vector2D(halfW * cosA + halfH * sinA, halfW * sinA - halfH * cosA),
@@ -183,7 +225,7 @@ class PhysicsEngine(
             )
 
             var lowestCornerY = block.position.y
-            var lowestCornerOffset = Vector2D.Zero
+            var lowestCornerOffset = Vector2D(0f, 0f)
             for (c in cornerOffsets) {
                 val worldCornerY = block.position.y + c.y
                 if (worldCornerY > lowestCornerY) {
@@ -198,18 +240,18 @@ class PhysicsEngine(
 
                 if (block.velocity.y > 0) {
                     val fallSpeed = block.velocity.y
-                    block.velocity.y = -block.velocity.y * (block.material.restitution * 0.2f)
+                    block.velocity.y = -block.velocity.y * (block.material.restitution * 0.18f)
                     block.velocity.x *= block.material.friction
 
-                    // Contact normal torque around pivot corner
+                    // Corner ground pivot torque
                     val groundNormal = Vector2D(0f, -1f)
-                    val groundImpulse = groundNormal * (fallSpeed * block.mass * 0.25f)
-                    val groundTorque = lowestCornerOffset.cross(groundImpulse) / (block.mass * 900f)
+                    val groundImpulse = groundNormal * (fallSpeed * block.mass * 0.2f)
+                    val groundTorque = lowestCornerOffset.cross(groundImpulse) / (block.mass * 1000f)
                     block.angularVelocity += groundTorque
 
-                    // High impact fall damage on hard collapse
-                    if (fallSpeed > 280f && block.damageCooldown <= 0f) {
-                        val fallDamage = (fallSpeed - 220f) * block.material.density * 0.12f
+                    // Fall impact damage
+                    if (fallSpeed > 300f && block.damageCooldown <= 0f) {
+                        val fallDamage = (fallSpeed - 240f) * block.material.density * 0.10f
                         block.takeDamage(fallDamage)
                         block.damageCooldown = 0.12f
                         soundManager.playImpact(block.material, fallDamage)
@@ -219,15 +261,15 @@ class PhysicsEngine(
                     }
                 }
 
-                // Settle to sleep on ground if velocity is negligible
-                if (block.velocity.lengthSquared() < 9f && abs(block.angularVelocity) < 0.08f) {
+                // Settle to resting equilibrium on ground if velocity has subsided
+                if (block.velocity.lengthSquared() < 16f && abs(block.angularVelocity) < 0.10f) {
                     block.isResting = true
-                    block.velocity = Vector2D.Zero
+                    block.velocity = Vector2D(0f, 0f)
                     block.angularVelocity = 0f
                 }
             }
 
-            // Left/right bounds
+            // Screen side bounds
             if (block.position.x - halfW < 0f) {
                 block.position.x = halfW
                 block.velocity.x = -block.velocity.x * 0.3f
@@ -238,14 +280,14 @@ class PhysicsEngine(
             }
         }
 
-        // 3. Integrate Monkeys (Rolling Physics & Fall Damage)
+        // 3. Integrate Active Monkeys
         for (monkey in monkeys) {
             if (monkey.isDefeated) continue
 
             monkey.damageCooldown = (monkey.damageCooldown - dt).coerceAtLeast(0f)
 
             if (monkey.isResting) {
-                monkey.velocity = Vector2D.Zero
+                monkey.velocity = Vector2D(0f, 0f)
                 monkey.angularVelocity = 0f
                 continue
             }
@@ -256,20 +298,19 @@ class PhysicsEngine(
             monkey.position += monkey.velocity * dt
             monkey.angle += monkey.angularVelocity * dt
 
-            // Ground collision & Ground Fall Damage
+            // Ground collision & rolling physics
             if (monkey.position.y + monkey.radius >= groundY) {
                 monkey.position.y = groundY - monkey.radius
                 if (monkey.velocity.y > 0) {
                     val impactSpeed = monkey.velocity.y
-                    monkey.velocity.y = -monkey.velocity.y * 0.22f
-                    monkey.velocity.x *= 0.80f // rolling on ground friction
+                    monkey.velocity.y = -monkey.velocity.y * 0.20f
+                    monkey.velocity.x *= 0.82f // rolling friction
 
-                    // Synchronize visual rolling rotation with horizontal velocity
                     monkey.angularVelocity = (monkey.velocity.x / monkey.radius) * 1.2f
 
-                    // Fatal / Heavy Fall Damage Calculation
-                    if (impactSpeed > 160f && monkey.damageCooldown <= 0f) {
-                        val fallDamage = (impactSpeed - 130f) * 0.55f
+                    // Fall damage on hard drop
+                    if (impactSpeed > 220f && monkey.damageCooldown <= 0f) {
+                        val fallDamage = (impactSpeed - 180f) * 0.60f
                         val dmgTaken = monkey.takeDamage(fallDamage, false)
                         monkey.damageCooldown = 0.18f
                         soundManager.playMonkeyReaction()
@@ -283,22 +324,21 @@ class PhysicsEngine(
                     }
                 }
 
-                // Settle to sleep on ground if stationary
-                if (monkey.velocity.lengthSquared() < 9f && abs(monkey.angularVelocity) < 0.08f) {
+                // Settle to resting equilibrium
+                if (monkey.velocity.lengthSquared() < 16f && abs(monkey.angularVelocity) < 0.10f) {
                     monkey.isResting = true
-                    monkey.velocity = Vector2D.Zero
+                    monkey.velocity = Vector2D(0f, 0f)
                     monkey.angularVelocity = 0f
                 }
             }
 
-            // Check if monkey fell off the world
             if (monkey.position.y > groundY + 60f) {
                 monkey.isDefeated = true
                 handleMonkeyDefeat(monkey)
             }
         }
 
-        // 4. Resolve Collisions: Fruit vs Block
+        // 4. Resolve Fruit vs Block (Localized impact only)
         for (fruit in fruits) {
             if (!fruit.isLaunched || fruit.isDead) continue
             for (block in blocks) {
@@ -307,7 +347,7 @@ class PhysicsEngine(
             }
         }
 
-        // 5. Resolve Collisions: Fruit vs Monkey
+        // 5. Resolve Fruit vs Monkey
         for (fruit in fruits) {
             if (!fruit.isLaunched || fruit.isDead) continue
             for (monkey in monkeys) {
@@ -316,7 +356,7 @@ class PhysicsEngine(
             }
         }
 
-        // 6. Resolve Collisions: Block vs Monkey (Dynamic Slope Rolling & Crush Damage)
+        // 6. Resolve Block vs Monkey
         for (block in blocks) {
             if (block.isBroken) continue
             for (monkey in monkeys) {
@@ -325,7 +365,7 @@ class PhysicsEngine(
             }
         }
 
-        // 7. Resolve Collisions: Block vs Block (Realistic Stacking, Toppling & Chain Collapse)
+        // 7. Resolve Block vs Block (Impulse transfer & chain reactions)
         val numBlocks = blocks.size
         for (i in 0 until numBlocks) {
             val b1 = blocks[i]
@@ -358,106 +398,112 @@ class PhysicsEngine(
             val localNormal = diff / dist
             val worldNormal = localNormal.rotate(block.angle)
 
-            // Wake up hit block immediately
+            // ONLY wake up this specific impacted block
             block.isResting = false
 
-            // Positional separation
-            fruit.position += worldNormal * (penetration * 0.75f)
-            block.position -= worldNormal * (penetration * 0.25f)
+            // Positional separation based on mass ratio
+            val totalMass = fruit.mass + block.mass
+            val fruitRatio = block.mass / totalMass
+            val blockRatio = fruit.mass / totalMass
 
+            fruit.position += worldNormal * (penetration * fruitRatio)
+            block.position -= worldNormal * (penetration * blockRatio * 0.5f)
+
+            // Velocity impulse calculation
             val relVel = fruit.velocity - block.velocity
             val velAlongNormal = relVel.dot(worldNormal)
 
             if (velAlongNormal < 0) {
                 val restitution = min(fruit.restitution, block.material.restitution)
-                // Boost impulse magnitude for powerful, satisfying fruit impact
-                val impulseMag = -(1f + restitution * 1.1f) * velAlongNormal / ((1f / fruit.mass) + (1f / block.mass))
-
+                val impulseMag = -(1f + restitution) * velAlongNormal / ((1f / fruit.mass) + (1f / block.mass))
                 val impulse = worldNormal * impulseMag
+
                 fruit.velocity += impulse / fruit.mass
                 block.velocity -= impulse / block.mass
 
-                // Strong Rotational Torque onto block to flip it over!
+                // Calculate realistic rotational torque
                 val arm = closestLocal.rotate(block.angle)
-                block.angularVelocity -= (arm.cross(impulse) / (block.mass * 600f))
+                val momentOfInertia = (block.mass * (block.width * block.width + block.height * block.height)) / 12f
+                val torque = arm.cross(-impulse)
+                block.angularVelocity += (torque / (momentOfInertia * 1.5f)).coerceIn(-18f, 18f)
 
-                // Wake up connected and surrounding blocks for physical momentum transfer
-                wakeUpSurroundingBlocks(block.position, 180f)
+                // Calculate damage to this specific block based on kinetic impact energy
+                val relSpeed = relVel.length()
+                val impactEnergy = (0.5f * fruit.mass * relSpeed * relSpeed * 0.0014f) * fruit.type.structuralDamageMult
 
-                // Damage calculation
-                val impactStrength = abs(velAlongNormal) * fruit.mass * fruit.type.structuralDamageMult * 1.35f
-                soundManager.playImpact(block.material, impactStrength)
+                if (impactEnergy >= block.material.minImpactToDamage && block.damageCooldown <= 0f) {
+                    val damage = (impactEnergy - block.material.minImpactToDamage * 0.4f) * 1.2f
+                    val dmgDone = block.takeDamage(damage)
+                    block.damageCooldown = 0.08f
 
-                if (impactStrength >= block.material.minImpactToDamage && block.damageCooldown <= 0f) {
-                    val dmg = (impactStrength - block.material.minImpactToDamage * 0.4f) * 1.6f
-                    block.takeDamage(dmg)
-                    block.damageCooldown = 0.06f
-                    spawnDebris(closestLocal.rotate(block.angle) + block.position, block.material, 6)
+                    soundManager.playImpact(block.material, relSpeed)
+                    spawnDebris(closestLocal.rotate(block.angle) + block.position, block.material, 5)
 
                     if (block.isBroken) {
                         handleBlockBreak(block)
+                    } else if (dmgDone > 5f) {
+                        onScoreAdded((dmgDone * 20).toInt(), block.position.copy(), "+${(dmgDone * 20).toInt()}", false)
                     }
+                } else {
+                    soundManager.playImpact(block.material, relSpeed * 0.5f)
                 }
 
-                // Abilities triggering on impact
-                if (fruit.type == FruitType.DURIAN && !fruit.hasUsedAbility && impactStrength > 50f) {
-                    triggerDurianSmash(fruit)
-                }
-                if (fruit.type == FruitType.ORANGE && !fruit.hasUsedAbility && impactStrength > 40f) {
-                    triggerOrangeBurst(fruit)
+                if (relSpeed >= 200f) {
+                    onShakeImpact?.invoke(if (relSpeed > 450f) ShakeImpact.NORMAL else ShakeImpact.MINOR)
                 }
             }
         }
     }
 
     private fun resolveFruitVsMonkey(fruit: FruitEntity, monkey: MonkeyEntity) {
-        val delta = fruit.position - monkey.position
-        val distSq = delta.lengthSquared()
-        val minDist = fruit.radius + monkey.radius
+        val relPos = monkey.position - fruit.position
+        val distSq = relPos.lengthSquared()
+        val totalRadius = fruit.radius + monkey.radius
 
-        if (distSq < minDist * minDist && distSq > 0.0001f) {
+        if (distSq < totalRadius * totalRadius && distSq > 0.0001f) {
             val dist = sqrt(distSq)
-            val normal = delta / dist
-            val penetration = minDist - dist
+            val normal = relPos / dist
+            val penetration = totalRadius - dist
 
-            // Wake up monkey immediately on physical impact
             monkey.isResting = false
 
-            fruit.position += normal * (penetration * 0.5f)
-            monkey.position -= normal * (penetration * 0.5f)
+            fruit.position -= normal * (penetration * 0.35f)
+            monkey.position += normal * (penetration * 0.65f)
 
             val relVel = fruit.velocity - monkey.velocity
             val velAlongNormal = relVel.dot(normal)
 
-            if (velAlongNormal < 0) {
-                val impulseMag = -(1f + 0.4f) * velAlongNormal / ((1f / fruit.mass) + (1f / 1.5f))
+            if (velAlongNormal > 0) {
+                val impulseMag = (1f + 0.3f) * velAlongNormal / ((1f / fruit.mass) + (1f / monkey.mass))
                 val impulse = normal * impulseMag
 
-                fruit.velocity += impulse / fruit.mass
-                monkey.velocity -= impulse / 1.5f
+                fruit.velocity -= impulse / fruit.mass
+                monkey.velocity += impulse / monkey.mass
 
-                // High spinning velocity from fruit strike
-                monkey.angularVelocity = (normal.cross(impulse) / 100f).coerceIn(-18f, 18f)
+                val impactSpeed = relVel.length()
+                val isDirectHeadHit = normal.y > 0.45f
+                val isCrit = isDirectHeadHit || impactSpeed > 450f
 
-                val isDirectFrontal = (fruit.velocity.x > 0 && monkey.position.x > fruit.position.x)
-                val rawDamage = (abs(velAlongNormal) * fruit.mass * 2.2f) + 25f
-                val dmgDone = monkey.takeDamage(rawDamage, isDirectFrontal)
+                val baseDmg = (impactSpeed * 0.35f + 15f) * fruit.type.structuralDamageMult
+                val damageTaken = monkey.takeDamage(baseDmg, isCrit)
 
                 soundManager.playMonkeyReaction()
-                spawnJuiceParticles(monkey.position, monkey.type.primaryColor, 8)
-                onScreenShake?.invoke(6f)
+                spawnJuiceParticles(monkey.position, monkey.type.primaryColor, if (isCrit) 16 else 8)
 
                 if (monkey.isDefeated) {
                     handleMonkeyDefeat(monkey)
                 } else {
-                    onScoreAdded((dmgDone * 50).toInt(), monkey.position.copy(), "CRUSH!", true)
+                    val popupText = if (isCrit) "CRITICAL HIT!" else "+${(damageTaken * 50).toInt()}"
+                    onScoreAdded((damageTaken * 50).toInt(), monkey.position.copy(), popupText, isCrit)
                 }
+
+                onShakeImpact?.invoke(if (isCrit) ShakeImpact.NORMAL else ShakeImpact.MINOR)
             }
         }
     }
 
     private fun resolveBlockVsMonkey(block: BlockEntity, monkey: MonkeyEntity, dt: Float) {
-        // If both are in stable rest, no need to process dynamic collision
+        // If both are resting in static equilibrium, skip
         if (block.isResting && monkey.isResting) return
 
         val halfW = block.width / 2f
@@ -474,50 +520,47 @@ class PhysicsEngine(
         val distSq = diff.lengthSquared()
 
         if (distSq < monkey.radius * monkey.radius && distSq > 0.0001f) {
-            // Wake both up when they interact dynamically
-            block.isResting = false
-            monkey.isResting = false
-
             val dist = sqrt(distSq)
             val penetration = monkey.radius - dist
             val worldNormal = (diff / dist).rotate(block.angle)
 
+            // Positional separation
             monkey.position += worldNormal * penetration
 
             val relVel = monkey.velocity - block.velocity
             val velAlongNormal = relVel.dot(worldNormal)
 
-            // --- SLOPE PHYSICS & GRAVITY ROLLING ---
-            // If monkey is perched on top of a tilted block, accelerate down the slope!
+            // Dynamic slope physics
             val isPerchedOnTop = localPos.y <= -halfH + 4f
-            if (isPerchedOnTop) {
-                val slopeAngle = block.angle
-                val slopeTangent = Vector2D(cos(slopeAngle), sin(slopeAngle))
+            if (isPerchedOnTop && (abs(block.angle) > 0.04f || block.velocity.lengthSquared() > 40f)) {
+                monkey.isResting = false
+                val slopeTangent = Vector2D(cos(block.angle), sin(block.angle))
                 val gravityAlongSlope = gravity.dot(slopeTangent)
-
-                // Accelerate monkey down the slope if block is tilted or moving
-                if (abs(slopeAngle) > 0.03f || block.velocity.lengthSquared() > 40f) {
-                    monkey.velocity += slopeTangent * (gravityAlongSlope * dt * 2.2f)
-                    // Visual rolling rotation matches velocity
-                    monkey.angularVelocity = (monkey.velocity.dot(slopeTangent) / monkey.radius) * 1.6f
-                    monkey.state = MonkeyState.SCARED
-                }
+                monkey.velocity += slopeTangent * (gravityAlongSlope * dt * 2.0f)
+                monkey.angularVelocity = (monkey.velocity.dot(slopeTangent) / monkey.radius) * 1.5f
+                monkey.state = MonkeyState.SCARED
             }
 
             if (velAlongNormal < 0) {
-                val impulseMag = -(1f + 0.25f) * velAlongNormal / ((1f / 1.5f) + (1f / block.mass))
+                // If collision has significant momentum, wake up both entities
+                val relSpeed = relVel.length()
+                if (relSpeed > 30f) {
+                    block.isResting = false
+                    monkey.isResting = false
+                }
+
+                val impulseMag = -(1f + 0.20f) * velAlongNormal / ((1f / 1.5f) + (1f / block.mass))
                 monkey.velocity += worldNormal * (impulseMag / 1.5f)
                 block.velocity -= worldNormal * (impulseMag / block.mass)
 
-                // CRUSH DAMAGE / FALL-ONTO-BLOCK DAMAGE
-                val relSpeed = relVel.length()
+                // Crush damage from falling block or hard impact
                 val isBlockFallingOnMonkey = block.velocity.y > 80f && block.position.y < monkey.position.y
-                val isMonkeyFallingOnBlock = monkey.velocity.y > 130f
+                val isMonkeyFallingOnBlock = monkey.velocity.y > 140f
 
-                if ((relSpeed > 130f || isBlockFallingOnMonkey || isMonkeyFallingOnBlock) && monkey.damageCooldown <= 0f) {
-                    val crushDamage = (relSpeed - 80f) * (block.mass * 0.08f + 0.4f) + 20f
+                if ((relSpeed > 140f || isBlockFallingOnMonkey || isMonkeyFallingOnBlock) && monkey.damageCooldown <= 0f) {
+                    val crushDamage = (relSpeed - 90f) * (block.mass * 0.07f + 0.4f) + 20f
                     val dmgDone = monkey.takeDamage(crushDamage, false)
-                    monkey.damageCooldown = 0.15f
+                    monkey.damageCooldown = 0.16f
                     soundManager.playImpact(block.material, relSpeed * 0.5f)
                     soundManager.playMonkeyReaction()
                     spawnJuiceParticles(monkey.position, monkey.type.primaryColor, 6)
@@ -533,7 +576,7 @@ class PhysicsEngine(
     }
 
     private fun resolveBlockVsBlock(b1: BlockEntity, b2: BlockEntity) {
-        // If both blocks are in resting equilibrium, skip collision calculation
+        // If both blocks are in static equilibrium, skip
         if (b1.isResting && b2.isResting) return
 
         val delta = b2.position - b1.position
@@ -543,11 +586,7 @@ class PhysicsEngine(
         val overlapX = totalHalfW - abs(delta.x)
         val overlapY = totalHalfH - abs(delta.y)
 
-        if (overlapX > 0 && overlapY > 0) {
-            // Wake up both blocks upon physical contact
-            b1.isResting = false
-            b2.isResting = false
-
+        if (overlapX > 0f && overlapY > 0f) {
             val normal: Vector2D
             val penetration: Float
 
@@ -559,96 +598,118 @@ class PhysicsEngine(
                 normal = if (delta.y > 0) Vector2D(0f, 1f) else Vector2D(0f, -1f)
             }
 
-            val m1Ratio = b2.mass / (b1.mass + b2.mass)
-            val m2Ratio = b1.mass / (b1.mass + b2.mass)
-
-            b1.position -= normal * (penetration * m1Ratio * 0.8f)
-            b2.position += normal * (penetration * m2Ratio * 0.8f)
-
             val relVel = b2.velocity - b1.velocity
             val velAlongNormal = relVel.dot(normal)
+            val relSpeed = relVel.length()
+
+            // Wake up a resting block ONLY if struck with dynamic momentum (> 25 px/s)
+            if (b1.isResting && (relSpeed > 25f || abs(velAlongNormal) > 15f)) {
+                b1.isResting = false
+            }
+            if (b2.isResting && (relSpeed > 25f || abs(velAlongNormal) > 15f)) {
+                b2.isResting = false
+            }
+
+            // Positional separation based on mass
+            val totalMass = b1.mass + b2.mass
+            val m1Ratio = b2.mass / totalMass
+            val m2Ratio = b1.mass / totalMass
+
+            if (!b1.isResting && !b2.isResting) {
+                b1.position -= normal * (penetration * m1Ratio * 0.6f)
+                b2.position += normal * (penetration * m2Ratio * 0.6f)
+            } else if (!b1.isResting) {
+                b1.position -= normal * (penetration * 0.9f)
+            } else if (!b2.isResting) {
+                b2.position += normal * (penetration * 0.9f)
+            }
 
             if (velAlongNormal < 0) {
-                val e = min(b1.material.restitution, b2.material.restitution) * 0.35f
-                val j = -(1f + e) * velAlongNormal / ((1f / b1.mass) + (1f / b2.mass))
+                val restitution = min(b1.material.restitution, b2.material.restitution) * 0.25f
+                val j = -(1f + restitution) * velAlongNormal / ((1f / b1.mass) + (1f / b2.mass))
                 val impulse = normal * j
 
-                b1.velocity -= impulse / b1.mass
-                b2.velocity += impulse / b2.mass
+                if (!b1.isResting) b1.velocity -= impulse / b1.mass
+                if (!b2.isResting) b2.velocity += impulse / b2.mass
 
-                // Toppling torque from eccentric contact
-                val contactArm1 = delta * 0.5f
-                val contactArm2 = -delta * 0.5f
-                b1.angularVelocity -= (contactArm1.cross(impulse) / (b1.mass * 800f))
-                b2.angularVelocity += (contactArm2.cross(impulse) / (b2.mass * 800f))
+                // Realistic rotational torque
+                val arm1 = normal * (b1.height / 2f)
+                val momentOfInertia1 = (b1.mass * (b1.width * b1.width + b1.height * b1.height)) / 12f
+                if (!b1.isResting) {
+                    b1.angularVelocity -= (arm1.cross(impulse) / (momentOfInertia1 * 2.0f)).coerceIn(-12f, 12f)
+                }
 
-                // Friction along contact plane
-                val tangent = Vector2D(-normal.y, normal.x)
-                val velAlongTangent = relVel.dot(tangent)
-                val friction = (b1.material.friction + b2.material.friction) / 2f
-                val frictionImpulse = tangent * (-velAlongTangent * friction * 0.55f)
+                val arm2 = normal * -(b2.height / 2f)
+                val momentOfInertia2 = (b2.mass * (b2.width * b2.width + b2.height * b2.height)) / 12f
+                if (!b2.isResting) {
+                    b2.angularVelocity += (arm2.cross(impulse) / (momentOfInertia2 * 2.0f)).coerceIn(-12f, 12f)
+                }
 
-                b1.velocity -= frictionImpulse / b1.mass
-                b2.velocity += frictionImpulse / b2.mass
-
-                // Structural crush damage during high-velocity impacts
-                val relSpeed = relVel.length()
-                if (relSpeed > 180f) {
-                    val crushImpulse = (relSpeed - 140f) * min(b1.mass, b2.mass) * 0.08f
-                    if (crushImpulse > 30f) {
-                        if (b1.damageCooldown <= 0f) {
-                            b1.takeDamage(crushImpulse * 0.2f)
-                            b1.damageCooldown = 0.12f
-                            if (b1.isBroken) handleBlockBreak(b1)
-                        }
-                        if (b2.damageCooldown <= 0f) {
-                            b2.takeDamage(crushImpulse * 0.2f)
-                            b2.damageCooldown = 0.12f
-                            if (b2.isBroken) handleBlockBreak(b2)
-                        }
+                // Heavy impact crush damage between blocks
+                if (relSpeed > 280f && (b1.damageCooldown <= 0f || b2.damageCooldown <= 0f)) {
+                    val crushEnergy = (relSpeed - 220f) * 0.20f
+                    if (crushEnergy > b1.material.minImpactToDamage && b1.damageCooldown <= 0f) {
+                        b1.takeDamage(crushEnergy)
+                        b1.damageCooldown = 0.12f
+                        if (b1.isBroken) handleBlockBreak(b1)
+                    }
+                    if (crushEnergy > b2.material.minImpactToDamage && b2.damageCooldown <= 0f) {
+                        b2.takeDamage(crushEnergy)
+                        b2.damageCooldown = 0.12f
+                        if (b2.isBroken) handleBlockBreak(b2)
                     }
                 }
             }
         }
     }
 
-    private fun wakeUpSurroundingBlocks(center: Vector2D, radius: Float) {
-        for (b in blocks) {
-            if (b.isBroken) continue
-            if (b.position.distanceTo(center) < radius) {
-                b.isResting = false
-            }
-        }
-        for (m in monkeys) {
-            if (m.isDefeated) continue
-            if (m.position.distanceTo(center) < radius) {
-                m.isResting = false
-                m.state = MonkeyState.SCARED
-            }
-        }
-    }
-
+    /**
+     * Handles block destruction and evaluates genuine physical support for remaining blocks and monkeys.
+     * Only blocks that were physically dependent on the destroyed block for vertical support begin falling.
+     */
     private fun handleBlockBreak(block: BlockEntity) {
         soundManager.playBreak(block.material)
-        spawnDebris(block.position, block.material, 12)
+        spawnDebris(block.position, block.material, 16)
         onBlockBroken(block)
-        onScreenShake?.invoke(5f)
         onScoreAdded(block.material.scoreValue, block.position.copy(), "+${block.material.scoreValue}", false)
+        onShakeImpact?.invoke(ShakeImpact.STRONG)
 
-        // Cascading collapse: wake up all blocks resting above or directly supported by this block
+        // Evaluate support for blocks resting above the broken block
         for (b in blocks) {
-            if (b.isBroken) continue
-            val dx = abs(b.position.x - block.position.x)
-            val isAboveOrTouching = b.position.y <= block.position.y + 15f && b.position.y >= block.position.y - 180f && dx < (b.width + block.width) * 0.85f
-            if (isAboveOrTouching) {
-                b.isResting = false
+            if (b.isBroken || b.id == block.id) continue
+
+            // If block rests on the ground, it is permanently supported
+            if (b.position.y + b.height / 2f >= groundY - 4f) continue
+
+            // Check if b was resting directly on top of the destroyed block
+            val isAbove = b.position.y < block.position.y
+            val verticalContact = abs((b.position.y + b.height / 2f) - (block.position.y - block.height / 2f)) < 14f
+            val horizontalOverlap = abs(b.position.x - block.position.x) < ((b.width + block.width) / 2f - 4f)
+
+            if (isAbove && verticalContact && horizontalOverlap) {
+                // Check if b has ANY other supporting block beneath it
+                val hasOtherSupport = blocks.any { other ->
+                    other.id != block.id && other.id != b.id && !other.isBroken &&
+                            other.position.y > b.position.y &&
+                            abs((b.position.y + b.height / 2f) - (other.position.y - other.height / 2f)) < 14f &&
+                            abs(b.position.x - other.position.x) < ((b.width + other.width) / 2f - 4f)
+                }
+
+                // If b lost its primary support, it begins falling/settling naturally
+                if (!hasOtherSupport) {
+                    b.isResting = false
+                }
             }
         }
+
+        // Evaluate support for monkeys resting on the broken block
         for (m in monkeys) {
             if (m.isDefeated) continue
-            val dx = abs(m.position.x - block.position.x)
-            val isAboveOrTouching = m.position.y <= block.position.y + 10f && m.position.y >= block.position.y - 140f && dx < (m.radius + block.width / 2f) + 20f
-            if (isAboveOrTouching) {
+            val isAbove = m.position.y < block.position.y
+            val verticalContact = abs((m.position.y + m.radius) - (block.position.y - block.height / 2f)) < 16f
+            val horizontalOverlap = abs(m.position.x - block.position.x) < (block.width / 2f + m.radius)
+
+            if (isAbove && verticalContact && horizontalOverlap) {
                 m.isResting = false
                 m.state = MonkeyState.SCARED
             }
@@ -659,7 +720,7 @@ class PhysicsEngine(
         soundManager.playMonkeyDefeat()
         spawnPoofParticles(monkey.position)
         onMonkeyDefeated(monkey)
-        onScreenShake?.invoke(10f)
+        onShakeImpact?.invoke(ShakeImpact.NORMAL)
         onScoreAdded(monkey.type.scoreValue, monkey.position.copy(), "+${monkey.type.scoreValue}", true)
     }
 
@@ -669,21 +730,22 @@ class PhysicsEngine(
         if (fruit.hasUsedAbility || !fruit.isLaunched || fruit.isDead) return
         fruit.hasUsedAbility = true
         soundManager.playAbilityBanana()
-        onScreenShake?.invoke(6f)
+        // Banana boost produces speed streak particles and whoosh sound without shaking the camera
+        onShakeImpact?.invoke(ShakeImpact.NONE)
 
-        val dir = if (fruit.velocity.lengthSquared() > 100f) fruit.velocity.normalized() else Vector2D(1f, -0.3f).normalized()
-        fruit.velocity = dir * (fruit.velocity.length().coerceAtLeast(450f) * 2.1f + 350f)
+        val dir = if (fruit.velocity.lengthSquared() > 100f) fruit.velocity.normalized() else Vector2D(1f, -0.25f).normalized()
+        fruit.velocity = dir * (fruit.velocity.length().coerceAtLeast(450f) * 1.8f + 250f)
 
         for (i in 0 until 18) {
             val angle = random.nextFloat() * 2f * PI.toFloat()
-            val speed = 90f + random.nextFloat() * 220f
+            val speed = 80f + random.nextFloat() * 200f
             particles.add(
                 ParticleEntity(
                     position = fruit.position.copy(),
-                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed) - (dir * 220f),
+                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed) - (dir * 200f),
                     color = if (i % 2 == 0) Color(0xFFFFEB3B) else Color(0xFFFF9800),
-                    size = 7f + random.nextFloat() * 7f,
-                    maxLifeTime = 0.55f,
+                    size = 6f + random.nextFloat() * 6f,
+                    maxLifeTime = 0.5f,
                     shape = ParticleShape.STAR
                 )
             )
@@ -694,9 +756,9 @@ class PhysicsEngine(
         if (fruit.hasUsedAbility || !fruit.isLaunched || fruit.isDead) return
         fruit.hasUsedAbility = true
         soundManager.playAbilityOrange()
-        onScreenShake?.invoke(18f)
+        onShakeImpact?.invoke(ShakeImpact.SPECIAL_ORANGE)
 
-        val blastRadius = 220f
+        val blastRadius = 180f
         val blastCenter = fruit.position
 
         spawnExplosionEffect(blastCenter, Color(0xFFFF9800), Color(0xFFFF5722))
@@ -705,12 +767,13 @@ class PhysicsEngine(
             if (block.isBroken) continue
             val dist = block.position.distanceTo(blastCenter)
             if (dist < blastRadius) {
+                block.isResting = false
                 val factor = (1f - (dist / blastRadius)).coerceIn(0f, 1f)
                 val dir = (block.position - blastCenter).normalized()
-                val force = dir * (factor * 1200f)
+                val force = dir * (factor * 950f)
                 block.velocity += force / block.mass
-                block.angularVelocity += (random.nextFloat() - 0.5f) * factor * 14f
-                block.takeDamage(factor * 110f)
+                block.angularVelocity += (random.nextFloat() - 0.5f) * factor * 10f
+                block.takeDamage(factor * 95f)
                 if (block.isBroken) handleBlockBreak(block)
             }
         }
@@ -719,10 +782,11 @@ class PhysicsEngine(
             if (monkey.isDefeated) continue
             val dist = monkey.position.distanceTo(blastCenter)
             if (dist < blastRadius) {
+                monkey.isResting = false
                 val factor = (1f - (dist / blastRadius)).coerceIn(0f, 1f)
                 val dir = (monkey.position - blastCenter).normalized()
-                monkey.velocity += dir * (factor * 950f)
-                monkey.takeDamage(factor * 85f, false)
+                monkey.velocity += dir * (factor * 800f)
+                monkey.takeDamage(factor * 75f, false)
                 if (monkey.isDefeated) handleMonkeyDefeat(monkey)
             }
         }
@@ -732,21 +796,22 @@ class PhysicsEngine(
         if (fruit.hasUsedAbility || !fruit.isLaunched || fruit.isDead) return emptyList()
         fruit.hasUsedAbility = true
         soundManager.playAbilityCherry()
-        onScreenShake?.invoke(4f)
+        // Cherry split has juice pop feedback without shaking the camera
+        onShakeImpact?.invoke(ShakeImpact.NONE)
 
         val baseSpeed = fruit.velocity.length().coerceAtLeast(350f)
         val baseAngle = fruit.velocity.angle()
 
-        fruit.velocity = Vector2D(cos(baseAngle) * baseSpeed * 1.15f, sin(baseAngle) * baseSpeed * 1.15f)
+        fruit.velocity = Vector2D(cos(baseAngle) * baseSpeed * 1.12f, sin(baseAngle) * baseSpeed * 1.12f)
 
-        val angleUp = baseAngle - 0.28f
-        val angleDown = baseAngle + 0.28f
+        val angleUp = baseAngle - 0.25f
+        val angleDown = baseAngle + 0.25f
 
         val child1 = FruitEntity(
             id = System.currentTimeMillis() + 1,
             type = FruitType.CHERRY,
-            position = fruit.position.copy() + Vector2D(0f, -14f),
-            velocity = Vector2D(cos(angleUp) * baseSpeed * 1.2f, sin(angleUp) * baseSpeed * 1.2f),
+            position = fruit.position.copy() + Vector2D(0f, -12f),
+            velocity = Vector2D(cos(angleUp) * baseSpeed * 1.15f, sin(angleUp) * baseSpeed * 1.15f),
             radius = fruit.radius * 0.9f,
             mass = fruit.mass * 0.9f,
             isLaunched = true,
@@ -757,8 +822,8 @@ class PhysicsEngine(
         val child2 = FruitEntity(
             id = System.currentTimeMillis() + 2,
             type = FruitType.CHERRY,
-            position = fruit.position.copy() + Vector2D(0f, 14f),
-            velocity = Vector2D(cos(angleDown) * baseSpeed * 1.2f, sin(angleDown) * baseSpeed * 1.2f),
+            position = fruit.position.copy() + Vector2D(0f, 12f),
+            velocity = Vector2D(cos(angleDown) * baseSpeed * 1.15f, sin(angleDown) * baseSpeed * 1.15f),
             radius = fruit.radius * 0.9f,
             mass = fruit.mass * 0.9f,
             isLaunched = true,
@@ -774,11 +839,11 @@ class PhysicsEngine(
         if (fruit.hasUsedAbility || !fruit.isLaunched || fruit.isDead) return
         fruit.hasUsedAbility = true
         soundManager.playAbilityDurian()
-        onScreenShake?.invoke(20f)
+        onShakeImpact?.invoke(ShakeImpact.SPECIAL_DURIAN)
 
-        fruit.velocity = Vector2D(fruit.velocity.x * 0.3f, 1100f)
+        fruit.velocity = Vector2D(fruit.velocity.x * 0.2f, 1050f)
 
-        val shockRadius = 280f
+        val shockRadius = 220f
         val shockCenter = fruit.position
 
         spawnExplosionEffect(shockCenter, Color(0xFF8D6E63), Color(0xFFC0CA33))
@@ -787,10 +852,11 @@ class PhysicsEngine(
             if (block.isBroken) continue
             val dist = block.position.distanceTo(shockCenter)
             if (dist < shockRadius) {
+                block.isResting = false
                 val factor = (1f - (dist / shockRadius))
-                block.velocity += Vector2D((random.nextFloat() - 0.5f) * 280f, -factor * 600f)
-                block.angularVelocity += (random.nextFloat() - 0.5f) * 16f
-                block.takeDamage(factor * 140f)
+                block.velocity += Vector2D((random.nextFloat() - 0.5f) * 220f, -factor * 500f)
+                block.angularVelocity += (random.nextFloat() - 0.5f) * 12f
+                block.takeDamage(factor * 120f)
                 if (block.isBroken) handleBlockBreak(block)
             }
         }
@@ -799,214 +865,153 @@ class PhysicsEngine(
             if (monkey.isDefeated) continue
             val dist = monkey.position.distanceTo(shockCenter)
             if (dist < shockRadius) {
+                monkey.isResting = false
                 val factor = (1f - (dist / shockRadius))
-                monkey.velocity += Vector2D((random.nextFloat() - 0.5f) * 350f, -factor * 650f)
-                monkey.takeDamage(factor * 120f, false)
+                monkey.velocity += Vector2D((random.nextFloat() - 0.5f) * 200f, -factor * 450f)
+                monkey.takeDamage(factor * 95f, false)
                 if (monkey.isDefeated) handleMonkeyDefeat(monkey)
             }
         }
     }
 
-    // --- TRAJECTORY CALCULATION ---
+    // --- TRAJECTORY PREDICTION (Exact Parabola Physics Match) ---
 
     fun calculateTrajectory(
         startPos: Vector2D,
         initialVelocity: Vector2D,
         fruitType: FruitType,
-        numPoints: Int = 28
+        steps: Int = 48,
+        stepDt: Float = 0.05f
     ): List<Vector2D> {
         val points = mutableListOf<Vector2D>()
         var pos = startPos.copy()
         var vel = initialVelocity.copy()
-        val dt = 0.040f
 
         points.add(pos.copy())
-        for (i in 1 until numPoints) {
-            vel += gravity * dt
-            pos += vel * dt
-            if (pos.y >= groundY) {
-                points.add(Vector2D(pos.x, groundY))
+
+        for (i in 0 until steps) {
+            vel += gravity * stepDt
+            vel *= (1.0f - 0.012f * stepDt).coerceIn(0.9f, 1.0f)
+            pos += vel * stepDt
+
+            // Stop trajectory if hitting ground
+            if (pos.y + fruitType.radius >= groundY) {
+                points.add(Vector2D(pos.x, groundY - fruitType.radius))
                 break
             }
+
+            // Stop trajectory if hitting the first block
+            var hitBlock = false
+            for (b in blocks) {
+                if (b.isBroken) continue
+                val halfW = b.width / 2f
+                val halfH = b.height / 2f
+                val relPos = pos - b.position
+                val localPos = relPos.rotate(-b.angle)
+                if (abs(localPos.x) <= halfW + fruitType.radius && abs(localPos.y) <= halfH + fruitType.radius) {
+                    points.add(pos.copy())
+                    hitBlock = true
+                    break
+                }
+            }
+            if (hitBlock) break
+
             points.add(pos.copy())
         }
+
         return points
     }
 
-    // --- VISUALS & PARTICLES ---
+    // --- PARTICLE EMITTERS ---
 
-    private fun updateVisuals(dt: Float) {
-        for (fruit in fruits) {
-            if (!fruit.isLaunched || fruit.isDead) continue
-
-            // Dynamic trajectory trail
-            if (fruit.velocity.lengthSquared() > 100f) {
-                fruit.addTrailPoint(fruit.position)
-            }
-
-            // Check if fruit has stopped moving (resting on ground or blocks)
-            val isSlow = fruit.velocity.lengthSquared() < 36f
-            val isNearRest = fruit.flightTime > 0.6f && (isSlow || fruit.isResting)
-
-            if (isNearRest) {
-                fruit.isResting = true
-                fruit.restingTimer += dt
-
-                // Disappear after 3 seconds of resting
-                if (fruit.restingTimer >= 3.0f) {
-                    // Smooth fade out over 0.5s
-                    fruit.alpha = (1f - (fruit.restingTimer - 3.0f) / 0.5f).coerceIn(0f, 1f)
-                }
-
-                if (fruit.restingTimer >= 3.5f) {
-                    // Poof particle effect and mark as dead
-                    spawnJuiceParticles(fruit.position, fruit.type.primaryColor, 8)
-                    spawnPoofParticles(fruit.position)
-                    fruit.isDead = true
-                }
-            } else {
-                fruit.restingTimer = 0f
-                fruit.alpha = 1.0f
-            }
-        }
-
-        val activeFruit = fruits.firstOrNull { it.isLaunched && !it.isResting && !it.isDead }
-        for (monkey in monkeys) {
-            if (monkey.isDefeated) continue
-
-            monkey.blinkTimer -= dt
-            if (monkey.blinkTimer <= 0f) {
-                monkey.isBlinking = !monkey.isBlinking
-                monkey.blinkTimer = if (monkey.isBlinking) 0.15f else (2f + random.nextFloat() * 3f)
-            }
-
-            if (monkey.hitTimer > 0f) {
-                monkey.hitTimer -= dt
-                monkey.state = MonkeyState.HIT
-            } else if (activeFruit != null && monkey.position.distanceTo(activeFruit.position) < 260f) {
-                monkey.state = MonkeyState.SCARED
-            } else if (abs(monkey.velocity.x) > 35f || monkey.velocity.y > 45f || abs(monkey.angularVelocity) > 2f) {
-                monkey.state = MonkeyState.SCARED
-            } else {
-                monkey.state = MonkeyState.IDLE
-            }
-        }
-
-        val iterator = particles.iterator()
-        while (iterator.hasNext()) {
-            val p = iterator.next()
-            p.lifeTime -= dt
-            if (p.lifeTime <= 0f) {
-                iterator.remove()
-            } else {
-                p.velocity += gravity * (dt * p.gravityFactor * 0.4f)
-                p.position += p.velocity * dt
-                p.rotation += p.rotationSpeed * dt
-            }
-        }
-    }
-
-    fun spawnJuiceParticles(pos: Vector2D, color: Color, count: Int) {
+    private fun spawnDebris(pos: Vector2D, material: MaterialType, count: Int) {
         for (i in 0 until count) {
             val angle = random.nextFloat() * 2f * PI.toFloat()
-            val speed = 50f + random.nextFloat() * 220f
+            val speed = 50f + random.nextFloat() * 180f
             particles.add(
                 ParticleEntity(
                     position = pos.copy(),
-                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed),
+                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed - 60f),
+                    color = if (i % 2 == 0) material.primaryColor else material.borderColor,
+                    size = 4f + random.nextFloat() * 5f,
+                    maxLifeTime = 0.6f + random.nextFloat() * 0.4f,
+                    shape = ParticleShape.SHARD
+                )
+            )
+        }
+    }
+
+    private fun spawnJuiceParticles(pos: Vector2D, color: Color, count: Int) {
+        for (i in 0 until count) {
+            val angle = random.nextFloat() * 2f * PI.toFloat()
+            val speed = 40f + random.nextFloat() * 140f
+            particles.add(
+                ParticleEntity(
+                    position = pos.copy(),
+                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed - 40f),
                     color = color,
-                    size = 5f + random.nextFloat() * 6f,
-                    maxLifeTime = 0.5f + random.nextFloat() * 0.4f,
+                    size = 4f + random.nextFloat() * 4f,
+                    maxLifeTime = 0.5f + random.nextFloat() * 0.3f,
                     shape = ParticleShape.CIRCLE
                 )
             )
         }
     }
 
-    fun spawnDebris(pos: Vector2D, material: MaterialType, count: Int) {
-        for (i in 0 until count) {
-            val angle = random.nextFloat() * 2f * PI.toFloat()
-            val speed = 60f + random.nextFloat() * 260f
-            particles.add(
-                ParticleEntity(
-                    position = pos.copy(),
-                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed),
-                    color = if (i % 2 == 0) material.primaryColor else material.borderColor,
-                    size = 6f + random.nextFloat() * 8f,
-                    maxLifeTime = 0.6f + random.nextFloat() * 0.4f,
-                    shape = if (material == MaterialType.GLASS) ParticleShape.SHARD else ParticleShape.CIRCLE,
-                    rotationSpeed = (random.nextFloat() - 0.5f) * 10f
-                )
-            )
-        }
-    }
-
-    fun spawnPoofParticles(pos: Vector2D) {
+    private fun spawnPoofParticles(pos: Vector2D) {
         for (i in 0 until 14) {
             val angle = random.nextFloat() * 2f * PI.toFloat()
-            val speed = 40f + random.nextFloat() * 140f
+            val speed = 30f + random.nextFloat() * 100f
             particles.add(
                 ParticleEntity(
                     position = pos.copy(),
-                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed),
-                    color = Color(0xEEFFFFFF),
-                    size = 14f + random.nextFloat() * 16f,
-                    maxLifeTime = 0.55f + random.nextFloat() * 0.3f,
-                    shape = ParticleShape.SMOKE,
-                    gravityFactor = -0.2f
-                )
-            )
-        }
-    }
-
-    fun spawnExplosionEffect(pos: Vector2D, color1: Color, color2: Color) {
-        particles.add(
-            ParticleEntity(
-                position = pos.copy(),
-                velocity = Vector2D.Zero,
-                color = color1,
-                size = 140f,
-                maxLifeTime = 0.4f,
-                shape = ParticleShape.RING,
-                gravityFactor = 0f
-            )
-        )
-        for (i in 0 until 20) {
-            val angle = random.nextFloat() * 2f * PI.toFloat()
-            val speed = 90f + random.nextFloat() * 280f
-            particles.add(
-                ParticleEntity(
-                    position = pos.copy(),
-                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed),
-                    color = if (i % 2 == 0) color1 else color2,
-                    size = 8f + random.nextFloat() * 10f,
-                    maxLifeTime = 0.55f + random.nextFloat() * 0.35f,
-                    shape = ParticleShape.STAR,
-                    gravityFactor = 0.3f
-                )
-            )
-        }
-    }
-
-    fun spawnConfettiVictory() {
-        val colors = listOf(
-            Color(0xFFFFEB3B), Color(0xFFFF5722), Color(0xFF4CAF50),
-            Color(0xFF2196F3), Color(0xFFE91E63), Color(0xFF9C27B0)
-        )
-        for (i in 0 until 50) {
-            val startX = 200f + random.nextFloat() * 600f
-            val startY = 100f + random.nextFloat() * 150f
-            val angle = (random.nextFloat() - 0.5f) * PI.toFloat()
-            val speed = 100f + random.nextFloat() * 300f
-            particles.add(
-                ParticleEntity(
-                    position = Vector2D(startX, startY),
-                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed - 150f),
-                    color = colors[random.nextInt(colors.size)],
+                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed - 30f),
+                    color = Color.White.copy(alpha = 0.75f),
                     size = 7f + random.nextFloat() * 7f,
-                    maxLifeTime = 1.8f + random.nextFloat() * 1.2f,
-                    shape = ParticleShape.SHARD,
-                    rotationSpeed = (random.nextFloat() - 0.5f) * 12f,
+                    maxLifeTime = 0.45f + random.nextFloat() * 0.25f,
+                    shape = ParticleShape.SMOKE
+                )
+            )
+        }
+    }
+
+    private fun spawnExplosionEffect(pos: Vector2D, color1: Color, color2: Color) {
+        for (i in 0 until 24) {
+            val angle = random.nextFloat() * 2f * PI.toFloat()
+            val speed = 80f + random.nextFloat() * 260f
+            particles.add(
+                ParticleEntity(
+                    position = pos.copy(),
+                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed - 60f),
+                    color = if (i % 2 == 0) color1 else color2,
+                    size = 6f + random.nextFloat() * 8f,
+                    maxLifeTime = 0.6f + random.nextFloat() * 0.3f,
+                    shape = ParticleShape.STAR
+                )
+            )
+        }
+    }
+
+    fun spawnConfettiVictory(center: Vector2D = Vector2D(worldWidth * 0.65f, 250f)) {
+        val colors = listOf(
+            Color(0xFFFFD54F),
+            Color(0xFFFF4081),
+            Color(0xFF00E676),
+            Color(0xFF00E5FF),
+            Color(0xFFFF9100),
+            Color(0xFFE040FB)
+        )
+        for (i in 0 until 45) {
+            val angle = random.nextFloat() * 2f * PI.toFloat()
+            val speed = 100f + random.nextFloat() * 320f
+            particles.add(
+                ParticleEntity(
+                    position = center.copy() + Vector2D((random.nextFloat() - 0.5f) * 120f, (random.nextFloat() - 0.5f) * 60f),
+                    velocity = Vector2D(cos(angle) * speed, sin(angle) * speed - 180f),
+                    color = colors[random.nextInt(colors.size)],
+                    size = 5f + random.nextFloat() * 6f,
+                    maxLifeTime = 1.4f + random.nextFloat() * 0.6f,
+                    shape = ParticleShape.STAR,
                     gravityFactor = 0.5f
                 )
             )

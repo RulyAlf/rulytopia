@@ -72,6 +72,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     private var gameLoopJob: Job? = null
     private var settlingTimer: Float = 0f
     private var shakeTrauma: Float = 0f
+    private val maxShakeOffsetPixels = 4.5f
 
     val physicsEngine: PhysicsEngine = PhysicsEngine(
         soundManager = soundManager,
@@ -86,13 +87,23 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         }
     )
 
-    private val maxPullRadius = 78f
-    private val launchSpeedMultiplier = 14.5f
+    private val maxPullRadius = 90f
+    private val launchSpeedMultiplier = 13.5f
 
     init {
-        // Connect Screen Shake
-        physicsEngine.onScreenShake = { intensity ->
-            shakeTrauma = (shakeTrauma + (intensity / 15f)).coerceIn(0f, 1f)
+        // Connect Controlled Screen Shake with Diminishing Returns Anti-Stacking
+        physicsEngine.onShakeImpact = { impact ->
+            if (impact != PhysicsEngine.ShakeImpact.NONE && impact.trauma > 0f) {
+                val effectiveAdd = impact.trauma * (1.0f - shakeTrauma * 0.75f).coerceAtLeast(0.08f)
+                shakeTrauma = (shakeTrauma + effectiveAdd).coerceIn(0f, 1.0f)
+            }
+        }
+
+        // Backward compatibility hook
+        physicsEngine.onScreenShake = { legacyIntensity ->
+            val legacyTrauma = (legacyIntensity / 40f).coerceIn(0.08f, 0.35f)
+            val effectiveAdd = legacyTrauma * (1.0f - shakeTrauma * 0.75f).coerceAtLeast(0.08f)
+            shakeTrauma = (shakeTrauma + effectiveAdd).coerceIn(0f, 1.0f)
         }
 
         // Sync preferences with sound manager
@@ -123,6 +134,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
     fun startLevel(levelId: Int) {
         soundManager.playButtonClick()
         currentLevelDef = LevelRepository.getLevel(levelId)
+        shakeTrauma = 0f
 
         physicsEngine.loadLevel(currentLevelDef)
 
@@ -488,25 +500,30 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         val targetOffsetX: Float
 
         if (activeFruit != null && _uiState.value.playState == PlayState.AIRBORNE) {
-            // Track fruit with leading offset
-            targetOffsetX = (activeFruit.position.x - 300f).coerceIn(0f, (currentLevelDef.worldWidth - 550f).coerceAtLeast(0f))
+            // Track fruit with leading offset across wide world
+            targetOffsetX = (activeFruit.position.x - 300f).coerceIn(0f, (currentLevelDef.worldWidth - 760f).coerceAtLeast(0f))
+        } else if (_uiState.value.playState == PlayState.SETTLING) {
+            // Keep camera focused on target area during settling
+            targetOffsetX = _uiState.value.cameraOffsetX
         } else {
-            // Default framing: centered on slingshot & structure
+            // Default framing: centered on slingshot
             targetOffsetX = 0f
         }
 
         // Smooth camera lerp
         val currentOffsetX = _uiState.value.cameraOffsetX
-        val newOffsetX = currentOffsetX + (targetOffsetX - currentOffsetX) * (dt * 4.5f).coerceIn(0f, 1f)
+        val newOffsetX = currentOffsetX + (targetOffsetX - currentOffsetX) * (dt * 4.2f).coerceIn(0f, 1f)
 
-        // Screen Shake calculation using non-linear trauma decay
+        // Screen Shake calculation using strictly capped non-linear trauma decay
         var shakeX = 0f
         var shakeY = 0f
         if (shakeTrauma > 0.001f) {
-            val shakeAmount = shakeTrauma * shakeTrauma * 16f
+            val shakeAmount = (shakeTrauma * shakeTrauma) * maxShakeOffsetPixels
             shakeX = (kotlin.random.Random.nextFloat() - 0.5f) * 2f * shakeAmount
             shakeY = (kotlin.random.Random.nextFloat() - 0.5f) * 2f * shakeAmount
-            shakeTrauma = (shakeTrauma - dt * 2.2f).coerceAtLeast(0f)
+            shakeTrauma = (shakeTrauma - dt * 4.2f).coerceAtLeast(0f)
+        } else {
+            shakeTrauma = 0f
         }
 
         _uiState.update {

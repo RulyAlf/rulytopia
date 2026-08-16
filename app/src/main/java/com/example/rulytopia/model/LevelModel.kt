@@ -36,11 +36,11 @@ data class LevelDef(
     val blocks: List<BlockDef>,
     val monkeys: List<MonkeyDef>,
     val starThresholds: Triple<Int, Int, Int>,
-    val slingshotX: Float = 140f,
-    val slingshotY: Float = 360f,
+    val slingshotX: Float = 180f,
+    val slingshotY: Float = 365f,
     val groundY: Float = 480f,
-    val worldWidth: Float = 1100f,
-    val worldHeight: Float = 560f
+    val worldWidth: Float = 1750f,
+    val worldHeight: Float = 600f
 ) {
     val worldId: Int get() = ((id - 1) / 20) + 1
 }
