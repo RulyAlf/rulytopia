@@ -16,6 +16,16 @@ data class MonkeyDef(
     val type: MonkeyType = MonkeyType.BASIC
 )
 
+data class WorldDef(
+    val id: Int,
+    val name: String,
+    val subtitle: String,
+    val description: String,
+    val levelRange: IntRange,
+    val themeColorHex: Long,
+    val accentColorHex: Long
+)
+
 data class LevelDef(
     val id: Int,
     val title: String,
@@ -31,4 +41,6 @@ data class LevelDef(
     val groundY: Float = 480f,
     val worldWidth: Float = 1100f,
     val worldHeight: Float = 560f
-)
+) {
+    val worldId: Int get() = ((id - 1) / 20) + 1
+}

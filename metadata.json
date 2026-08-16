@@ -1,6 +1,6 @@
 {
   "name": "Rulytopia",
-  "description": "A vibrant 2D physics puzzle game where players launch unique fruits from a slingshot to defeat mischievous monkeys and topple complex structures across 10 exciting levels.",
+  "description": "A vibrant 2D physics puzzle game where players launch unique fruits from a slingshot to defeat mischievous monkeys and topple complex structures across 100 handcrafted & procedural levels in 5 themed worlds.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

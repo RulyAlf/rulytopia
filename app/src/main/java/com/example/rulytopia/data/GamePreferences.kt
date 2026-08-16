@@ -3,6 +3,7 @@ package com.example.rulytopia.data
 import android.content.Context
 import android.content.SharedPreferences
 import com.example.rulytopia.model.FruitType
+import com.example.rulytopia.model.LevelRepository
 
 class GamePreferences(context: Context) {
 
@@ -49,7 +50,7 @@ class GamePreferences(context: Context) {
 
     fun unlockLevel(levelId: Int) {
         if (levelId > highestUnlockedLevel) {
-            highestUnlockedLevel = levelId.coerceAtMost(10)
+            highestUnlockedLevel = levelId.coerceAtMost(LevelRepository.TOTAL_LEVELS)
         }
     }
 
@@ -63,8 +64,17 @@ class GamePreferences(context: Context) {
 
     fun getTotalStars(): Int {
         var total = 0
-        for (i in 1..10) {
+        for (i in 1..LevelRepository.TOTAL_LEVELS) {
             total += getLevelStars(i)
+        }
+        return total
+    }
+
+    fun getWorldStars(worldId: Int): Int {
+        val world = LevelRepository.getWorld(worldId)
+        var total = 0
+        for (lvl in world.levelRange) {
+            total += getLevelStars(lvl)
         }
         return total
     }

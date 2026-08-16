@@ -168,7 +168,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
 
     fun nextLevel() {
         soundManager.playButtonClick()
-        val nextId = (_uiState.value.currentLevelId + 1).coerceAtMost(10)
+        val nextId = (_uiState.value.currentLevelId + 1).coerceAtMost(LevelRepository.TOTAL_LEVELS)
         startLevel(nextId)
     }
 

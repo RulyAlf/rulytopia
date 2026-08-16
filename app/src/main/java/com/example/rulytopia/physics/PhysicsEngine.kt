@@ -89,20 +89,6 @@ class PhysicsEngine(
     fun step(dt: Float) {
         val clampedDt = dt.coerceIn(0.001f, 0.033f)
 
-        // If no shot has been fired yet, keep structures stable at start
-        if (!hasFirstShotOccurred) {
-            for (block in blocks) {
-                block.velocity = Vector2D.Zero
-                block.angularVelocity = 0f
-            }
-            for (monkey in monkeys) {
-                monkey.velocity = Vector2D.Zero
-                monkey.angularVelocity = 0f
-            }
-            updateVisuals(clampedDt)
-            return
-        }
-
         val substeps = 6
         val subDt = clampedDt / substeps
 
@@ -156,21 +142,30 @@ class PhysicsEngine(
             }
         }
 
-        // 2. Integrate Blocks (With Tilted Center-of-Mass Instability & Torque)
+        // 2. Integrate Blocks (Only active moving/unsupported blocks undergo physics)
         for (block in blocks) {
             if (block.isBroken) continue
 
             block.damageCooldown = (block.damageCooldown - dt).coerceAtLeast(0f)
+
+            // If block is in stable resting state, it remains completely static in equilibrium
+            if (block.isResting) {
+                block.velocity = Vector2D.Zero
+                block.angularVelocity = 0f
+                continue
+            }
+
+            // Dynamic active block integration
             block.velocity += gravity * dt
 
-            // Instability Torque: if block is tilted, gravity produces natural tipping torque!
-            if (abs(block.angle) > 0.02f) {
-                val tiltTorque = sin(block.angle) * (gravity.y * 0.0006f)
+            // Instability tipping torque for dynamic tilted blocks
+            if (abs(block.angle) > 0.05f) {
+                val tiltTorque = sin(block.angle) * (gravity.y * 0.0004f)
                 block.angularVelocity += tiltTorque * dt
             }
 
-            block.velocity *= 0.995f // natural subtle damping
-            block.angularVelocity *= 0.985f
+            block.velocity *= 0.992f // subtle air damping
+            block.angularVelocity *= 0.980f
             block.position += block.velocity * dt
             block.angle += block.angularVelocity * dt
 
@@ -178,7 +173,6 @@ class PhysicsEngine(
             val halfH = block.height / 2f
             val halfW = block.width / 2f
 
-            // Check the 4 rotated corners against the ground
             val cosA = cos(block.angle)
             val sinA = sin(block.angle)
             val cornerOffsets = arrayOf(
@@ -204,18 +198,18 @@ class PhysicsEngine(
 
                 if (block.velocity.y > 0) {
                     val fallSpeed = block.velocity.y
-                    block.velocity.y = -block.velocity.y * (block.material.restitution * 0.25f)
+                    block.velocity.y = -block.velocity.y * (block.material.restitution * 0.2f)
                     block.velocity.x *= block.material.friction
 
                     // Contact normal torque around pivot corner
                     val groundNormal = Vector2D(0f, -1f)
-                    val groundImpulse = groundNormal * (fallSpeed * block.mass * 0.3f)
-                    val groundTorque = lowestCornerOffset.cross(groundImpulse) / (block.mass * 800f)
+                    val groundImpulse = groundNormal * (fallSpeed * block.mass * 0.25f)
+                    val groundTorque = lowestCornerOffset.cross(groundImpulse) / (block.mass * 900f)
                     block.angularVelocity += groundTorque
 
                     // High impact fall damage on hard collapse
-                    if (fallSpeed > 260f && block.damageCooldown <= 0f) {
-                        val fallDamage = (fallSpeed - 200f) * block.material.density * 0.12f
+                    if (fallSpeed > 280f && block.damageCooldown <= 0f) {
+                        val fallDamage = (fallSpeed - 220f) * block.material.density * 0.12f
                         block.takeDamage(fallDamage)
                         block.damageCooldown = 0.12f
                         soundManager.playImpact(block.material, fallDamage)
@@ -223,6 +217,13 @@ class PhysicsEngine(
                             handleBlockBreak(block)
                         }
                     }
+                }
+
+                // Settle to sleep on ground if velocity is negligible
+                if (block.velocity.lengthSquared() < 9f && abs(block.angularVelocity) < 0.08f) {
+                    block.isResting = true
+                    block.velocity = Vector2D.Zero
+                    block.angularVelocity = 0f
                 }
             }
 
@@ -237,14 +238,21 @@ class PhysicsEngine(
             }
         }
 
-        // 3. Integrate Monkeys (Rolling Physics, Tilting Acceleration & Fall Damage)
+        // 3. Integrate Monkeys (Rolling Physics & Fall Damage)
         for (monkey in monkeys) {
             if (monkey.isDefeated) continue
 
             monkey.damageCooldown = (monkey.damageCooldown - dt).coerceAtLeast(0f)
+
+            if (monkey.isResting) {
+                monkey.velocity = Vector2D.Zero
+                monkey.angularVelocity = 0f
+                continue
+            }
+
             monkey.velocity += gravity * dt
-            monkey.velocity *= 0.992f
-            monkey.angularVelocity *= 0.96f
+            monkey.velocity *= 0.990f
+            monkey.angularVelocity *= 0.95f
             monkey.position += monkey.velocity * dt
             monkey.angle += monkey.angularVelocity * dt
 
@@ -253,15 +261,15 @@ class PhysicsEngine(
                 monkey.position.y = groundY - monkey.radius
                 if (monkey.velocity.y > 0) {
                     val impactSpeed = monkey.velocity.y
-                    monkey.velocity.y = -monkey.velocity.y * 0.25f
-                    monkey.velocity.x *= 0.82f // rolling on ground friction
+                    monkey.velocity.y = -monkey.velocity.y * 0.22f
+                    monkey.velocity.x *= 0.80f // rolling on ground friction
 
                     // Synchronize visual rolling rotation with horizontal velocity
                     monkey.angularVelocity = (monkey.velocity.x / monkey.radius) * 1.2f
 
                     // Fatal / Heavy Fall Damage Calculation
-                    if (impactSpeed > 150f && monkey.damageCooldown <= 0f) {
-                        val fallDamage = (impactSpeed - 120f) * 0.55f
+                    if (impactSpeed > 160f && monkey.damageCooldown <= 0f) {
+                        val fallDamage = (impactSpeed - 130f) * 0.55f
                         val dmgTaken = monkey.takeDamage(fallDamage, false)
                         monkey.damageCooldown = 0.18f
                         soundManager.playMonkeyReaction()
@@ -273,6 +281,13 @@ class PhysicsEngine(
                             onScoreAdded((dmgTaken * 40).toInt(), monkey.position.copy(), "+FALL DAMAGE!", false)
                         }
                     }
+                }
+
+                // Settle to sleep on ground if stationary
+                if (monkey.velocity.lengthSquared() < 9f && abs(monkey.angularVelocity) < 0.08f) {
+                    monkey.isResting = true
+                    monkey.velocity = Vector2D.Zero
+                    monkey.angularVelocity = 0f
                 }
             }
 
@@ -343,6 +358,9 @@ class PhysicsEngine(
             val localNormal = diff / dist
             val worldNormal = localNormal.rotate(block.angle)
 
+            // Wake up hit block immediately
+            block.isResting = false
+
             // Positional separation
             fruit.position += worldNormal * (penetration * 0.75f)
             block.position -= worldNormal * (penetration * 0.25f)
@@ -363,8 +381,8 @@ class PhysicsEngine(
                 val arm = closestLocal.rotate(block.angle)
                 block.angularVelocity -= (arm.cross(impulse) / (block.mass * 600f))
 
-                // Wake up nearby blocks for cascading chain reaction
-                wakeUpSurroundingBlocks(block.position, 220f)
+                // Wake up connected and surrounding blocks for physical momentum transfer
+                wakeUpSurroundingBlocks(block.position, 180f)
 
                 // Damage calculation
                 val impactStrength = abs(velAlongNormal) * fruit.mass * fruit.type.structuralDamageMult * 1.35f
@@ -402,6 +420,9 @@ class PhysicsEngine(
             val normal = delta / dist
             val penetration = minDist - dist
 
+            // Wake up monkey immediately on physical impact
+            monkey.isResting = false
+
             fruit.position += normal * (penetration * 0.5f)
             monkey.position -= normal * (penetration * 0.5f)
 
@@ -436,6 +457,9 @@ class PhysicsEngine(
     }
 
     private fun resolveBlockVsMonkey(block: BlockEntity, monkey: MonkeyEntity, dt: Float) {
+        // If both are in stable rest, no need to process dynamic collision
+        if (block.isResting && monkey.isResting) return
+
         val halfW = block.width / 2f
         val halfH = block.height / 2f
 
@@ -450,6 +474,10 @@ class PhysicsEngine(
         val distSq = diff.lengthSquared()
 
         if (distSq < monkey.radius * monkey.radius && distSq > 0.0001f) {
+            // Wake both up when they interact dynamically
+            block.isResting = false
+            monkey.isResting = false
+
             val dist = sqrt(distSq)
             val penetration = monkey.radius - dist
             val worldNormal = (diff / dist).rotate(block.angle)
@@ -505,6 +533,9 @@ class PhysicsEngine(
     }
 
     private fun resolveBlockVsBlock(b1: BlockEntity, b2: BlockEntity) {
+        // If both blocks are in resting equilibrium, skip collision calculation
+        if (b1.isResting && b2.isResting) return
+
         val delta = b2.position - b1.position
         val totalHalfW = (b1.width + b2.width) / 2f
         val totalHalfH = (b1.height + b2.height) / 2f
@@ -513,6 +544,10 @@ class PhysicsEngine(
         val overlapY = totalHalfH - abs(delta.y)
 
         if (overlapX > 0 && overlapY > 0) {
+            // Wake up both blocks upon physical contact
+            b1.isResting = false
+            b2.isResting = false
+
             val normal: Vector2D
             val penetration: Float
 
@@ -582,9 +617,6 @@ class PhysicsEngine(
             if (b.isBroken) continue
             if (b.position.distanceTo(center) < radius) {
                 b.isResting = false
-                // Add slight destabilizing impulse to break artificial equilibrium
-                b.velocity += Vector2D((random.nextFloat() - 0.5f) * 35f, (random.nextFloat() - 0.5f) * 20f)
-                b.angularVelocity += (random.nextFloat() - 0.5f) * 0.8f
             }
         }
         for (m in monkeys) {
@@ -592,7 +624,6 @@ class PhysicsEngine(
             if (m.position.distanceTo(center) < radius) {
                 m.isResting = false
                 m.state = MonkeyState.SCARED
-                m.velocity += Vector2D((random.nextFloat() - 0.5f) * 40f, (random.nextFloat() - 0.5f) * 20f)
             }
         }
     }
@@ -604,8 +635,24 @@ class PhysicsEngine(
         onScreenShake?.invoke(5f)
         onScoreAdded(block.material.scoreValue, block.position.copy(), "+${block.material.scoreValue}", false)
 
-        // Cascading collapse: wake up all blocks above or surrounding this broken block!
-        wakeUpSurroundingBlocks(block.position, 280f)
+        // Cascading collapse: wake up all blocks resting above or directly supported by this block
+        for (b in blocks) {
+            if (b.isBroken) continue
+            val dx = abs(b.position.x - block.position.x)
+            val isAboveOrTouching = b.position.y <= block.position.y + 15f && b.position.y >= block.position.y - 180f && dx < (b.width + block.width) * 0.85f
+            if (isAboveOrTouching) {
+                b.isResting = false
+            }
+        }
+        for (m in monkeys) {
+            if (m.isDefeated) continue
+            val dx = abs(m.position.x - block.position.x)
+            val isAboveOrTouching = m.position.y <= block.position.y + 10f && m.position.y >= block.position.y - 140f && dx < (m.radius + block.width / 2f) + 20f
+            if (isAboveOrTouching) {
+                m.isResting = false
+                m.state = MonkeyState.SCARED
+            }
+        }
     }
 
     private fun handleMonkeyDefeat(monkey: MonkeyEntity) {
